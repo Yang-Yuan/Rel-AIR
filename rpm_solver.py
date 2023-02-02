@@ -53,23 +53,44 @@ class flat(nn.Module):
 class ConvBlock(nn.Module):
     def __init__(self, in_ch, out_ch, dim):
         super(ConvBlock, self).__init__()
+        self.dim = dim
         self.conv  = getattr(nn, 'Conv{}d'.format(dim))(in_ch, out_ch, K_D, stride=dim, padding=K_D//2)
+        self.elu = nn.ELU()
         self.bnrm  = getattr(nn, 'BatchNorm{}d'.format(dim))(out_ch)
-        self.drop  = nn.Sequential(perm(), nn.Dropout2d(DR_S), perm()) if dim==1 else nn.Dropout2d(DR_S)
-        self.block = nn.Sequential(self.conv, nn.ELU(), self.bnrm, self.drop)
+        self.drop  = nn.Dropout2d(DR_S)
     def forward(self, x):
-        return self.block(x)
+        x = self.conv(x)
+        x = self.elu(x)
+        x = self.bnrm(x)
+        if 1 == self.dim:
+            x = x.permute(0, 2, 1)
+            x = self.drop(x)
+            x = x.permute(0, 2, 1)
+        else:
+            x = self.drop(x)
+        return x
 
 #Residual block class, made up of two convolutional blocks.
 class ResBlock(nn.Module):
     def __init__(self, in_ch, hd_ch, out_ch, dim):
         super(ResBlock, self).__init__()
         self.dim  = dim
-        self.conv = nn.Sequential(ConvBlock(in_ch, hd_ch, dim), ConvBlock(hd_ch, out_ch, dim))
-        self.down = nn.Sequential(nn.MaxPool2d(3, 2, 1), nn.MaxPool2d(3, 2, 1))
+        self.conv1 = ConvBlock(in_ch, hd_ch, dim)
+        self.conv2 = ConvBlock(hd_ch, out_ch, dim)
+        self.pool1 = nn.MaxPool2d(3, 2, 1)
+        self.pool2 = nn.MaxPool2d(3, 2, 1)
         self.skip = getattr(nn, 'Conv{}d'.format(dim))(in_ch, out_ch, 1, bias=False)
     def forward(self, x):
-        return self.conv(x) + self.skip(x if self.dim==1 else self.down(x))
+        if 1 == self.dim:
+            x_skip = self.skip(x)
+        else:
+            x_skip = self.pool1(x)
+            x_skip = self.pool2(x_skip)
+            x_skip = self.skip(x_skip)
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = x + x_skip
+        return x
 
 #Relational net class, defining three models with which to extract relations in RPM problems.
 class RelNet(nn.Module):
@@ -81,18 +102,30 @@ class RelNet(nn.Module):
                
         if model in ["Rel-AIR", "Rel-Base"]:
             lin_in = S_OC*S_PL
-            self.obj_enc = nn.Sequential(ResBlock(   1, F_HC, F_HC, 2), ResBlock(F_HC, F_HC, F_OC, 2))
-            self.seq_enc = nn.Sequential(ResBlock(   9, S_OC, S_HC, 1), nn.MaxPool1d(6, 4, 1), 
-                                         ResBlock(S_HC, S_HC, S_OC, 1), nn.AdaptiveAvgPool1d(S_PL))
+            # self.obj_enc = nn.Sequential(ResBlock(   1, F_HC, F_HC, 2), ResBlock(F_HC, F_HC, F_OC, 2))
+            self.obj_res1 = ResBlock(1, F_HC, F_HC, 2)
+            self.obj_res2 = ResBlock(F_HC, F_HC, F_OC, 2)
+
+            # self.seq_enc = nn.Sequential(ResBlock(   9, S_OC, S_HC, 1), nn.MaxPool1d(6, 4, 1),
+            #                              ResBlock(S_HC, S_HC, S_OC, 1), nn.AdaptiveAvgPool1d(S_PL))
+            self.seq_res1 = ResBlock(9, S_OC, S_HC, 1)
+            self.seq_max = nn.MaxPool1d(6, 4, 1)
+            self.seq_res2 = ResBlock(S_HC, S_HC, S_OC, 1)
+            self.seq_avg = nn.AdaptiveAvgPool1d(S_PL)
+
             if model in ["Rel-AIR"]:
                 self.obj_rel   = nn.Sequential(ResBlock(n_s, S_HC, S_HC, 1), ResBlock(S_HC, S_HC, 1, 1))
                 self.bilinear  = nn.Bilinear(F_Z, BL_IN, BLOUT)
                 self.ebd       = nn.Sequential(nn.ELU(), nn.BatchNorm1d(BLOUT))
 
-        elif model in ["ResNet", "Context-blind"]:
+        elif model in ["ResNet"]:
             lin_in = O_OC*F_PL
-            self.og_net = nn.Sequential(ResBlock(9 if model=="ResNet" else 8, O_HC, O_HC, 2), ResBlock(O_HC, O_HC, O_OC, 2))
-            
+            self.res1 = ResBlock(9, O_HC, O_HC, 2)
+            self.res2 = ResBlock(O_HC, O_HC, O_OC, 2)
+        elif model in ["Context-blind"]:
+            lin_in = O_OC * F_PL
+            self.res1 = ResBlock(8, O_HC, O_HC, 2)
+            self.res2 = ResBlock(O_HC, O_HC, O_OC, 2)
         else:
             print("Model \"{}\" unrecognised.".format(model))
             sys.exit(1)
@@ -128,26 +161,42 @@ class RelNet(nn.Module):
         elif self.model=='Rel-Base':
             #1. Encode each frame independently.
             x = x.view(-1, 1, 80, 80)
-            x = self.obj_enc(x).flatten(1)
+            # x = self.obj_enc(x).flatten(1)
+            x = self.obj_res1(x)
+            x = self.obj_res2(x)
+            x = x.flatten(1)
             
             #2. Assemble sequences. 
             x = x.view(-1, 16, F_Z)
             x = self.stack(x)
                         
             #3. Extract frame relationships and score sequences.
-            x = self.seq_enc(x.view(-1, 9, F_Z)).flatten(1)
+            # x = self.seq_enc(x.view(-1, 9, F_Z)).flatten(1)
+            x = x.view(-1, 9, F_Z)
+            x = self.seq_res1(x)
+            x = self.seq_max(x)
+            x = self.seq_res2(x)
+            x = self.seq_avg(x)
+            x = x.flatten(1)
+
             return self.linear(x).view(-1, 8)
         
         elif self.model=='ResNet':
             #1. Assemble sequences, extract frame relationships, score sequences.
             x = self.stack(x)
-            x = self.og_net(x.view(-1, 9, 80, 80)).flatten(1)
-            return self.linear(x).view(-1, 8)
-        
+            x = x.view(-1, 9, 80, 80)
+            x = self.res1(x)
+            x = self.res2(x)
+            x = x.flatten(1)
+            x = self.linear(x)
+            x= x.view(-1, 8)
+            return x
         else:
-            x = self.og_net(x[:, 8:])
-            return self.linear(x.flatten(1))
-            
+            x = self.res1(x[:, 8:])
+            x = self.res2(x)
+            x = self.linear(x)
+            x = x.flatten(1)
+            return x
       
 #Main model class.
 class RPM_Solver(BasicModel):
@@ -167,3 +216,78 @@ class RPM_Solver(BasicModel):
         return out
 
 # END SCRIPT -------------------------------------------------------------------------------------------------------- #
+"""
+RelNet(
+  (og_net): Sequential(
+    (0): ResBlock(
+      (conv): Sequential(
+        (0): ConvBlock(
+          (conv): Conv2d(9, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3))
+          (bnrm): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (drop): Dropout2d(p=0.1, inplace=False)
+          (block): Sequential(
+            (0): Conv2d(9, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3))
+            (1): ELU(alpha=1.0)
+            (2): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+            (3): Dropout2d(p=0.1, inplace=False)
+          )
+        )
+        (1): ConvBlock(
+          (conv): Conv2d(64, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3))
+          (bnrm): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (drop): Dropout2d(p=0.1, inplace=False)
+          (block): Sequential(
+            (0): Conv2d(64, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3))
+            (1): ELU(alpha=1.0)
+            (2): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+            (3): Dropout2d(p=0.1, inplace=False)
+          )
+        )
+      )
+      (down): Sequential(
+        (0): MaxPool2d(kernel_size=3, stride=2, padding=1, dilation=1, ceil_mode=False)
+        (1): MaxPool2d(kernel_size=3, stride=2, padding=1, dilation=1, ceil_mode=False)
+      )
+      (skip): Conv2d(9, 64, kernel_size=(1, 1), stride=(1, 1), bias=False)
+    )
+    (1): ResBlock(
+      (conv): Sequential(
+        (0): ConvBlock(
+          (conv): Conv2d(64, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3))
+          (bnrm): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (drop): Dropout2d(p=0.1, inplace=False)
+          (block): Sequential(
+            (0): Conv2d(64, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3))
+            (1): ELU(alpha=1.0)
+            (2): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+            (3): Dropout2d(p=0.1, inplace=False)
+          )
+        )
+        (1): ConvBlock(
+          (conv): Conv2d(64, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3))
+          (bnrm): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (drop): Dropout2d(p=0.1, inplace=False)
+          (block): Sequential(
+            (0): Conv2d(64, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3))
+            (1): ELU(alpha=1.0)
+            (2): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+            (3): Dropout2d(p=0.1, inplace=False)
+          )
+        )
+      )
+      (down): Sequential(
+        (0): MaxPool2d(kernel_size=3, stride=2, padding=1, dilation=1, ceil_mode=False)
+        (1): MaxPool2d(kernel_size=3, stride=2, padding=1, dilation=1, ceil_mode=False)
+      )
+      (skip): Conv2d(64, 64, kernel_size=(1, 1), stride=(1, 1), bias=False)
+    )
+  )
+  (linear): Sequential(
+    (0): Linear(in_features=1600, out_features=512, bias=True)
+    (1): ELU(alpha=1.0)
+    (2): BatchNorm1d(512, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+    (3): Dropout(p=0.5, inplace=False)
+    (4): Linear(in_features=512, out_features=1, bias=True)
+  )
+)
+"""
